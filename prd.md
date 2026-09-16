@@ -28,10 +28,13 @@ As support teams scale, manual ticket assignment by team leads breaks down. Lead
 ## 5. Core Definitions & Logic
 To ensure clarity, the following definitions govern the system's behavior:
 
-* **Availability:** An agent is "available" if the current time (converted to the agent's local timezone) falls within their defined recurring weekly schedule.
+* **Availability:** An agent is "available" if the current time falls within their recurring weekly schedule in their local IANA timezone.
+  * **Overnight Shifts:** Supported (e.g., 22:00–06:00). Weekdays are determined strictly by local wall-clock time.
+  * **DST Handling:** Shifts are defined in local wall-clock time. DST gaps/folds are resolved by converting local boundaries to UTC via standard IANA rules, automatically adjusting the shift's absolute duration.
 * **Fairness (Load Balancing):** Work is distributed by assigning tickets to the available agent with the lowest number of active tickets. 
 * **Tie-Breaker (Recency):** If multiple available agents have the same lowest active ticket count, the ticket goes to the agent who was assigned a ticket least recently.
 * **Active Ticket:** A ticket currently assigned to an agent that has not been marked as resolved or closed.
+* **Target Capacity (Soft Limit):** A preferred maximum number of active tickets for an agent. The system will prioritize assigning tickets to agents under this limit. If all available agents are over this limit, the system will still assign the ticket to the agent with the lowest load to ensure no ticket is left unowned.
 * **Coverage Gap:** A time window where zero agents on the team are scheduled to be available.
 
 ## 6. User Stories
@@ -44,7 +47,8 @@ To ensure clarity, the following definitions govern the system's behavior:
 
 ### Support Agent
 * **Fair Workload:** As a Support Agent, I want tickets to be distributed evenly among available peers so that the workload is fair across the team.
-* **Capacity Protection:** As a Support Agent, I want the system to stop assigning me new tickets when I reach my maximum capacity so I can focus on resolving my current queue without falling behind.
+* **Capacity Protection:** As a Support Agent, I want the system to prioritize giving new tickets to agents who are under their target capacity, and alert my Team Lead when we are all overloaded, so that we can manage expectations and adjust schedules before burnout occurs.
+
 
 ### Customer (Indirect)
 * **Immediate Ownership:** As a Customer, I want my support ticket to be immediately assigned to a team member so that I know my issue is being actively handled.
@@ -58,20 +62,26 @@ The UI allows Team Leads to configure the team and visualize their coverage.
 * **Coverage Visualization:** A timeline view showing overall team coverage. It must visually highlight "Coverage Gaps" (no agents scheduled) and "Capacity Warnings" (scheduled agents likely to exceed max capacity based on current load).
 
 ### 7.2. Automated Ticket Assignment
-The system processes incoming tickets and automatically assigns them.
-* **Assignment Logic:** Evaluate all agents for the company. Filter for those who are currently "Available" AND under their "Max Active Tickets" limit. Sort by lowest active ticket count, then by least recently assigned. Assign to the top agent.
-* **Transparency:** The system must generate and store a human-readable reason for every assignment (e.g., *"Available, lowest active load, least recently assigned"*).
+* **Assignment Contract:** The assignment operation accepts `company_id` and `ticket_id`.
+  * **Success Outcome:** Returns the assigned agent, the assignment reason, and confirms the ticket is now owned.
+  * **No-Assignment Outcome:** If the company has zero agents configured, the operation fails and returns an "Unassignable" error, preventing the ticket from entering a void.
+  * **Idempotency (Retries):** If the system receives a request for a `ticket_id` that has already been assigned, it must return the *original* assignment details. It must not create a duplicate assignment, nor should it alter the agent's active ticket count or advance the fairness/recency state.
+* **Assignment Logic:** Evaluate all agents for the company. Filter for those who are currently "Available". Sort the available agents by: 
+  1. Agents currently *under* their Target Capacity (preferred).
+  2. Lowest active ticket count.
+  3. Least recently assigned.
+  Assign to the top agent. *(Note: If all available agents are over their Target Capacity, the system ignores the capacity preference and simply assigns to the available agent with the absolute lowest load).*
 
 ### 7.3. Ticket Resolution Tracking
-To maintain accurate "active ticket" counts, the system must track when tickets are closed.
-* **Resolution Handling:** The system must listen for or provide a mechanism to mark tickets as resolved, automatically decrementing the assigned agent's active ticket count.
+* **Resolution Flow:** The system provides a dedicated resolution API endpoint (e.g., `POST /tickets/{ticket_id}/resolve`), alongside a "Resolve" action in the UI, to mark tickets as closed.
+* **Duplicate-Close Behavior:** The resolution action is strictly idempotent. If a ticket is marked as resolved but is already in a "resolved" state, the system treats it as a no-op. It will not decrement the active ticket count below zero, nor will it trigger duplicate state changes or fairness adjustments.
 
 ## 8. Edge Cases & Product Behavior
 
 | Scenario | Product Behavior |
 | :--- | :--- |
 | **No agents are currently available** | The system will still assign the ticket to prevent it from sitting unassigned. It will choose the agent with the lowest overall workload and flag the assignment as "out of hours" for the Team Lead to review. |
-| **All available agents are at max capacity** | The system will prioritize availability over capacity limits to ensure the ticket is handled, assigning it to the available agent with the lowest current load. |
+| **All available agents are over Target Capacity** | The system prioritizes ticket ownership over capacity limits. It will assign the ticket to the available agent with the lowest overall active load. The assignment is explicitly flagged as "Over Capacity" in the UI so the Team Lead knows the team is overloaded and needs to adjust schedules or hire. |
 | **Empty team** | The system will reject the assignment and alert the Team Lead that the team has no agents configured, preventing tickets from falling into a void. |
 | **Agent's timezone changes** | The system will immediately recalculate availability based on the new timezone for all future assignments. |
 
