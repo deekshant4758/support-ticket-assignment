@@ -58,8 +58,8 @@ To ensure clarity, the following definitions govern the system's behavior:
 ### 7.1. Availability & Coverage Management (UI)
 The UI allows Team Leads to configure the team and visualize their coverage.
 * **Agent Management:** View a list of agents, add/remove agents, and set their local timezones.
-* **Schedule Management:** Define a recurring weekly schedule for each agent (e.g., Monday 09:00 - 17:00) and define their "Max Active Tickets" capacity.
-* **Coverage Visualization:** A timeline view showing overall team coverage. It must visually highlight "Coverage Gaps" (no agents scheduled) and "Capacity Warnings" (scheduled agents likely to exceed max capacity based on current load).
+* **Schedule Management:** Define a recurring weekly schedule for each agent (e.g., Monday 09:00 - 17:00) and define their "Target Capacity".
+* **Coverage Visualization:** A timeline view showing overall team coverage. It must visually highlight "Coverage Gaps" (no agents scheduled) and "Capacity Warnings" (scheduled agents likely to exceed Target Capacity based on current load).
 
 ### 7.2. Automated Ticket Assignment
 * **Assignment Contract:** The assignment operation accepts `company_id` and `ticket_id`.
@@ -70,7 +70,7 @@ The UI allows Team Leads to configure the team and visualize their coverage.
   1. Agents currently *under* their Target Capacity (preferred).
   2. Lowest active ticket count.
   3. Least recently assigned.
-  Assign to the top agent. *(Note: If all available agents are over their Target Capacity, the system ignores the capacity preference and simply assigns to the available agent with the absolute lowest load).*
+  Assign to the top agent. *(Note: If all available agents are at or above their Target Capacity, the system ignores the capacity preference and simply assigns to the available agent with the absolute lowest load).*
 
 ### 7.3. Ticket Resolution Tracking
 * **Resolution Flow:** The system provides a dedicated resolution API endpoint (e.g., `POST /tickets/{ticket_id}/resolve`), alongside a "Resolve" action in the UI, to mark tickets as closed.
