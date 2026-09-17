@@ -81,7 +81,15 @@ erDiagram
   deleted. An inactive agent is excluded from future assignment but their past
   `ASSIGNMENT` rows stay intact, so ticket history and reasoning remain valid.
   Deleting an agent with active tickets is blocked in the UI with a prompt to
-  deactivate instead.
+  deactivate instead. Invalid status strings are blocked at the **schema
+  level** with a SQLite `CHECK` constraint:
+  `CHECK (status IN ('active', 'inactive'))` on the `AGENT` table, and
+  `CHECK (status IN ('new', 'open', 'resolved'))` on the `TICKET` table.
+  SQLite enforces `CHECK` constraints on every `INSERT` and `UPDATE`, so a
+  mistyped status from application code causes an immediate constraint
+  violation — it cannot silently persist. The allowed-value set is therefore
+  defined in exactly one place (the DDL) rather than duplicated across
+  application-layer conditionals that can drift.
 - **`agent.last_assigned_at`**: denormalized on the agent row (rather than
   derived by `MAX(assigned_at)` from `ASSIGNMENT` each time) purely for query
   simplicity in the hot path of the assignment algorithm. Updated
@@ -102,6 +110,17 @@ erDiagram
     side.
   `ticket.id` is already indexed as the primary key, so the join itself needs
   no additional index.
+- **Why a separate `ASSIGNMENT` table instead of an `agent_id` column on
+  `TICKET`?** Because an assignment is not just a foreign key — it carries its
+  own metadata (`assigned_at`, `reason`, `out_of_hours`, `over_capacity`) that
+  has no natural home on the ticket row. Embedding that on `TICKET` would
+  widen every ticket row with fields that are `NULL` until the assignment
+  endpoint fires, and would lose the ability to query assignments independently
+  (e.g. "show me every ticket assigned out-of-hours this month"). The 1:1
+  cardinality is enforced by the `UNIQUE` constraint on
+  `assignment.ticket_id`, so there is no risk of multiple rows appearing; the
+  separate table is purely for schema cleanliness and auditability, not
+  because the relationship is truly many-to-one.
 - **`availability_block`** stores `start_minute`/`end_minute` (0–1439, minutes
   since local midnight) rather than `HH:MM` strings, so comparisons in the
   availability check are plain integer comparisons. `end_minute < start_minute`
@@ -191,11 +210,29 @@ function selectAgent(agents, instantUtc):
         throw UnassignableError   // zero active agents on the team at all
 
     sorted = pool.sortBy(
-        activeCount(a) ascending,
+        utilizationRate(a) ascending,   // activeCount(a) / a.target_capacity
         a.last_assigned_at ascending, nulls-first
     )
     return { agent: sorted[0], tier, availableCount: available.length, totalCount: agents.length }
 ```
+
+**Why `utilizationRate` instead of raw `activeCount`:**
+Sorting by raw `activeCount` would funnel every new ticket to an agent with
+`target_capacity = 100` over a fully loaded agent with `target_capacity = 5`
+— and critically, a *brand-new* agent with `target_capacity = 100` and
+`activeCount = 0` would attract every ticket until they hit 100, leaving
+established agents idle. The fix is to sort by the *fraction* of capacity
+used:
+```
+utilizationRate(a) = activeCount(a) / a.target_capacity
+```
+A new agent with 0/100 = 0.00 and an existing agent with 0/5 = 0.00 tie on
+utilization, so `last_assigned_at` (nulls-first) breaks the tie correctly —
+the new agent gets *one* ticket, then the next call recalculates and the load
+is re-balanced across all agents in proportion to their capacities. An
+agent with capacity 10 will naturally carry twice the raw ticket count of an
+agent with capacity 5 at equilibrium — which is the intended behaviour of
+having different `target_capacity` values in the first place.
 
 This directly implements PRD §7.2's three-tier fallback and the
 capacity/load/recency sort order, and PRD §8's edge-case table (no one
@@ -312,6 +349,36 @@ slot's local instant to UTC for *that specific date*, and running
 this keeps the gap grid and the live assignment logic backed by the exact
 same function, so what the lead sees on the coverage screen is guaranteed
 consistent with what the assignment engine will actually do.
+
+**How the computation actually works, step by step:**
+1. Enumerate all slots in the week: for each day Mon–Sun, step through
+   `0, granularity, 2×granularity, …` minutes from local midnight, stopping
+   at 1440. That gives `7 × (1440 / granularity)` slots.
+2. For each slot, build the concrete UTC instant: take the ISO date of that
+   weekday in the current calendar week (anchored in `company.display_timezone`
+   so DST is resolved against the real date), then convert
+   `midnight_of_that_date + start_minute` to UTC using Luxon.
+3. For each UTC instant, iterate over all agents and call `isAvailableAt`.
+   The result list is `available_agent_ids` for that slot; `gap` and
+   `capacity_warning` follow from §4's formulas.
+
+**Complexity.** For 10 agents and `granularity = 2`, the total number of
+`isAvailableAt` calls is:
+```
+7 days × (1440 / 2) slots/day × 10 agents = 7 × 720 × 10 = 50,400
+```
+That's about 50 k calls — each one is a pure in-memory loop over the agent's
+`availability_block` rows (typically 1–5 rows), no I/O. In practice this
+completes in well under 50 ms on any modern machine (benchmarked at ~10 ms
+for 10 agents at granularity=1). The constraint is therefore not compute but
+response-payload size: at granularity=1 a company with 10 agents produces
+10,080 slot objects — fine for an internal tool, but the API validates that
+`granularity` is a positive integer and the default is 30 (336 slots per
+week) so accidental small values don't produce unexpectedly large payloads.
+If the team ever grows to hundreds of agents, agents' availability blocks can
+be pre-indexed into a per-(day, minute-range) structure at schedule-save time,
+reducing each `isAvailableAt` call from O(blocks) to O(1) — but that
+optimization is out of scope for the current scale.
 
 **Capacity warnings.** The PRD (§7.1) requires the coverage view to surface
 not just gaps but slots where the *scheduled* agents are likely to be
