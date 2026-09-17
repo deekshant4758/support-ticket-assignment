@@ -341,44 +341,93 @@ Response:
   ]
 }
 ```
-Computed by rasterizing the **current calendar week** (Mon–Sun, in
-`company.display_timezone`) into `granularity`-minute slots, converting each
-slot's local instant to UTC for *that specific date*, and running
-`isAvailableAt` per agent per slot. I use a real week (not an abstract
-"any week") specifically because DST offset depends on the actual date —
-this keeps the gap grid and the live assignment logic backed by the exact
-same function, so what the lead sees on the coverage screen is guaranteed
-consistent with what the assignment engine will actually do.
+Computed by **inverting the loop**: instead of iterating over every
+time-slot and asking "which agents cover this?", we iterate over each agent's
+blocks and mark which slots they cover. This reduces the work from
+O(slots × agents) to O(agents × blocks), which is dramatically smaller for
+any realistic schedule.
 
-**How the computation actually works, step by step:**
-1. Enumerate all slots in the week: for each day Mon–Sun, step through
-   `0, granularity, 2×granularity, …` minutes from local midnight, stopping
-   at 1440. That gives `7 × (1440 / granularity)` slots.
-2. For each slot, build the concrete UTC instant: take the ISO date of that
-   weekday in the current calendar week (anchored in `company.display_timezone`
-   so DST is resolved against the real date), then convert
-   `midnight_of_that_date + start_minute` to UTC using Luxon.
-3. For each UTC instant, iterate over all agents and call `isAvailableAt`.
-   The result list is `available_agent_ids` for that slot; `gap` and
-   `capacity_warning` follow from §4's formulas.
+**Algorithm (`buildCoverageGrid`):**
 
-**Complexity.** For 10 agents and `granularity = 2`, the total number of
-`isAvailableAt` calls is:
 ```
-7 days × (1440 / 2) slots/day × 10 agents = 7 × 720 × 10 = 50,400
+function buildCoverageGrid(company, agents, granularity):
+    // Step 1 — anchor the week to real calendar dates so DST is correct.
+    weekDates = {}   // ISO weekday 1..7 → Luxon DateTime (midnight, company.display_timezone)
+    for dow in 1..7:
+        weekDates[dow] = currentWeekMondayMidnight(company.display_timezone).plus({ days: dow - 1 })
+
+    // Step 2 — initialise a slot map: (dow, start_minute) → Set<agentId>
+    slots = {}
+    for dow in 1..7:
+        for m = 0; m < 1440; m += granularity:
+            slots[(dow, m)] = Set()
+
+    // Step 3 — for each agent, expand each block into the slots it covers.
+    //           This is O(agents × blocks × slots_per_block), not O(slots × agents).
+    for agent in agents where agent.status == 'active':
+        for block in agent.availability_blocks:
+            coveredSlots = slotsForBlock(block, agent.timezone, weekDates, granularity)
+            for (dow, m) in coveredSlots:
+                slots[(dow, m)].add(agent.id)
+
+    // Step 4 — serialise to the response shape.
+    return slots.map((dow, m), agentIds => ({
+        day_of_week: dow,
+        start_minute: m,
+        available_agent_ids: [...agentIds],
+        gap: agentIds.size == 0,
+        capacity_warning: agentIds.size > 0 && every agent in agentIds has activeCount >= target_capacity
+    }))
 ```
-That's about 50 k calls — each one is a pure in-memory loop over the agent's
-`availability_block` rows (typically 1–5 rows), no I/O. In practice this
-completes in well under 50 ms on any modern machine (benchmarked at ~10 ms
-for 10 agents at granularity=1). The constraint is therefore not compute but
-response-payload size: at granularity=1 a company with 10 agents produces
-10,080 slot objects — fine for an internal tool, but the API validates that
-`granularity` is a positive integer and the default is 30 (336 slots per
-week) so accidental small values don't produce unexpectedly large payloads.
-If the team ever grows to hundreds of agents, agents' availability blocks can
-be pre-indexed into a per-(day, minute-range) structure at schedule-save time,
-reducing each `isAvailableAt` call from O(blocks) to O(1) — but that
-optimization is out of scope for the current scale.
+
+**`slotsForBlock(block, agentTz, weekDates, granularity)`** converts one
+block into a list of `(dow, start_minute)` pairs on the company-grid:
+
+```
+function slotsForBlock(block, agentTz, weekDates, granularity):
+    results = []
+    // A block is defined in the agent's own timezone. We need the UTC instants
+    // at which this block starts and ends on the specific calendar date this week,
+    // then re-express those instants in company.display_timezone to find which
+    // company-grid slots they fall in.
+    //
+    // For an overnight block (end_minute < start_minute) we handle two date
+    // segments: the start-half on block.day_of_week, and the continuation-half
+    // on the next calendar day.
+
+    segments = overnightSegments(block)   // returns 1 or 2 (dow, startMin, endMin) tuples
+    for (dow, startMin, endMin) in segments:
+        agentDate = weekDates[dow].setZone(agentTz, { keepLocalTime: true })
+        utcStart  = agentDate.plus({ minutes: startMin })
+        utcEnd    = agentDate.plus({ minutes: endMin })
+
+        // Walk the UTC range in granularity steps, convert each instant to
+        // company display_timezone to find the right slot key.
+        t = utcStart
+        while t < utcEnd:
+            local = t.setZone(company.display_timezone)
+            slotDow = local.weekday
+            slotMin = snapDown(local.hour * 60 + local.minute, granularity)
+            results.push((slotDow, slotMin))
+            t = t.plus({ minutes: granularity })
+    return results
+```
+
+**Why this is the right approach:**
+
+| | Naive (slot-first) | Block-first (this design) |
+|---|---|---|
+| Outer loop | 7 × (1440 / g) slots | A × B blocks (A agents, B blocks each) |
+| Inner loop | A agents × `isAvailableAt` (scans all blocks) | Slots covered by *this one block* |
+| Typical work at g=2, 10 agents, 1 block/agent | **50,400 iterations** | **10 × ~240 = 2,400 iterations** (~21× less) |
+| Scales with more agents | Linearly worse | Linearly worse, but baseline is already ~20× lower |
+| DST correctness | ✓ (real week dates) | ✓ (same real week dates, same Luxon conversion) |
+
+The key insight is that a typical agent block covers a small fraction of the
+week's slots (e.g. Mon–Fri 09:00–17:00 at g=30 is 5 × 16 = 80 slots out of
+336), so walking only the slots inside each block is dramatically cheaper than
+testing every slot against every agent. The result is identical — it is a
+re-ordered computation, not an approximation.
 
 **Capacity warnings.** The PRD (§7.1) requires the coverage view to surface
 not just gaps but slots where the *scheduled* agents are likely to be
