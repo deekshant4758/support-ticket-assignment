@@ -86,11 +86,22 @@ erDiagram
   derived by `MAX(assigned_at)` from `ASSIGNMENT` each time) purely for query
   simplicity in the hot path of the assignment algorithm. Updated
   transactionally alongside the `ASSIGNMENT` insert.
-- **Active ticket count is *not* stored** — it's `COUNT(*) FROM ticket WHERE
-  agent_id = ? AND status = 'open'`. I chose derived-over-stored to avoid a
-  counter that can drift out of sync with reality; the PRD's "internal state
-  for active_ticket_counts" requirement is satisfied by this query, backed by
-  an index on `(agent_id, status)` so it stays O(log n).
+- **Active ticket count is *not* stored** — `agent_id` lives on `ASSIGNMENT`,
+  not on `TICKET`, so the count is `SELECT COUNT(*) FROM assignment a JOIN
+  ticket t ON t.id = a.ticket_id WHERE a.agent_id = ? AND t.status = 'open'`.
+  I chose derived-over-stored to avoid a counter that can drift out of sync
+  with reality; the PRD's "internal state for active_ticket_counts"
+  requirement is satisfied by this query. Since every ticket has at most one
+  `ASSIGNMENT` row (enforced by a `UNIQUE` constraint on
+  `assignment.ticket_id`), the join is 1:1 and cheap. Supporting indexes,
+  named consistently as `idx_<table>_<columns>`:
+  - `idx_assignment_agent_id ON assignment(agent_id)` — narrows to the one
+    agent's assignments before the join runs.
+  - `idx_ticket_status ON ticket(status)` — also used by the tickets-list
+    endpoint (§4), and lets the query planner filter on `status` from either
+    side.
+  `ticket.id` is already indexed as the primary key, so the join itself needs
+  no additional index.
 - **`availability_block`** stores `start_minute`/`end_minute` (0–1439, minutes
   since local midnight) rather than `HH:MM` strings, so comparisons in the
   availability check are plain integer comparisons. `end_minute < start_minute`
@@ -126,13 +137,24 @@ function isAvailableAt(agent, instantUtc):
                 return true
         else:
             // overnight block, e.g. 22:00-06:00 (start > end)
-            prevDow = ((dow - 2) % 7) + 1              // yesterday, ISO weekday
+            // JS `%` is remainder, not modulo, so it can return negative
+            // values for a negative dividend (dow=1 - 2 = -1, and -1 % 7
+            // is -1 in JS, not 6). Add 7 before taking the modulo so the
+            // result is always in [0, 6], then map back to ISO 1..7.
+            prevDow = ((dow - 2 + 7) % 7) + 1          // yesterday, ISO weekday
             if block.day_of_week == dow and tod >= block.start_minute:
                 return true                             // still in first half, same local day
             if block.day_of_week == prevDow and tod < block.end_minute:
                 return true                             // in the continuation from yesterday's block
     return false
 ```
+
+`prevDow` for Monday (`dow = 1`) must be Sunday (`7`): `((1 - 2 + 7) % 7) + 1
+= (6 % 7) + 1 = 7`. The earlier version, `((dow - 2) % 7) + 1`, computed
+`((1 - 2) % 7) + 1 = (-1 % 7) + 1 = -1 + 1 = 0` for Monday — a day of week
+that doesn't exist in the 1–7 scheme, which silently broke matching for any
+block starting Sunday night and continuing into Monday morning. This is
+covered explicitly in §7's test list below.
 
 **Why this handles DST correctly without special-casing it:** the function
 never computes a *duration* — it only asks "what is the local wall-clock day
@@ -197,12 +219,12 @@ exactly the same explanation.
 
 ```
 function assignTicket(companyId, ticketId, clock):
+    ticket = db.getTicket(ticketId)
+    if not ticket or ticket.company_id != companyId: throw NotFoundError
+
     existing = db.getAssignment(ticketId)
     if existing:
         return { ...existing, idempotent_replay: true }   // no state change at all
-
-    ticket = db.getTicket(ticketId)
-    if not ticket or ticket.company_id != companyId: throw NotFoundError
 
     agents = db.getAgents(companyId)
     if agents is empty: throw UnassignableError("no agents configured for company")
@@ -216,9 +238,19 @@ function assignTicket(companyId, ticketId, clock):
     return { ...assignment, idempotent_replay: false }
 ```
 
-The idempotency check is the *first* thing that happens, before touching
-availability or load at all — this guarantees a retried request never
-double-counts against fairness or capacity, per PRD §7.2.
+Ownership is validated **before** the idempotency check, not after. The
+earlier version checked `db.getAssignment(ticketId)` first and returned it
+directly — a request for an already-assigned ticket that quoted the *wrong*
+`company_id` would still get back the assignee's name and reason, silently
+bypassing the cross-company 404 documented in §4. Looking the ticket up by
+`ticketId` alone and trusting the caller-supplied `companyId` without
+cross-checking it against the row is exactly the mistake to avoid here: an
+attacker (or a buggy client) could enumerate another company's ticket IDs and
+harvest agent names off the replay path even though the "new assignment"
+path was correctly scoped. Fetching the ticket and comparing
+`ticket.company_id` first closes that gap for both paths uniformly. This is
+covered explicitly by an "assigned-ticket, mismatched company" regression
+case in §7 below.
 
 ### 3.5 Resolution idempotency
 
@@ -267,8 +299,8 @@ Response:
   "week_start": "2026-09-14",
   "slot_minutes": 30,
   "slots": [
-    { "day_of_week": 1, "start_minute": 0, "available_agent_ids": [], "gap": true },
-    { "day_of_week": 1, "start_minute": 30, "available_agent_ids": ["3fa2c1d4-8b2e-4a1f-9c3d-7e5f6a1b2c3d"], "gap": false }
+    { "day_of_week": 1, "start_minute": 0,  "available_agent_ids": [], "gap": true,  "capacity_warning": false },
+    { "day_of_week": 1, "start_minute": 30, "available_agent_ids": ["3fa2c1d4-8b2e-4a1f-9c3d-7e5f6a1b2c3d"], "gap": false, "capacity_warning": true }
   ]
 }
 ```
@@ -280,6 +312,34 @@ slot's local instant to UTC for *that specific date*, and running
 this keeps the gap grid and the live assignment logic backed by the exact
 same function, so what the lead sees on the coverage screen is guaranteed
 consistent with what the assignment engine will actually do.
+
+**Capacity warnings.** The PRD (§7.1) requires the coverage view to surface
+not just gaps but slots where the *scheduled* agents are likely to be
+overloaded — this was missing from the original response shape and is added
+here. For each slot:
+```
+capacity_warning = available_agent_ids.length > 0
+    AND every agent in available_agent_ids currently has
+        activeCount(agent) >= agent.target_capacity
+```
+i.e. a slot is a capacity warning when someone is scheduled, but if a ticket
+landed at that instant right now it would have to fall into the
+`over_capacity` tier of `selectAgent` (§3.2) — literally the same condition,
+computed per slot instead of once per ticket. `gap` and `capacity_warning`
+are mutually exclusive (`gap` implies zero available agents, so the "every
+agent is at capacity" check is vacuously true only when there's at least
+one — the `available_agent_ids.length > 0` guard prevents a gap slot from
+also reading as a warning).
+
+One deliberate simplification: `activeCount(agent)` is evaluated **once, at
+request time**, using each agent's *real current* open-ticket count, and
+applied uniformly across every slot in the week — including slots in the
+past and future. This is a live "if a ticket arrived right now" snapshot
+projected onto the whole grid, not a simulation of what load will actually
+be at 3pm next Thursday (which nothing in scope lets us predict). I call
+this out explicitly in the UI as "load shown as of now" so a lead doesn't
+read a Thursday warning as a guarantee — it's read as "the people scheduled
+for this slot are, as of today, already stretched thin."
 
 ### Assignment
 
@@ -336,6 +396,7 @@ flowchart LR
     B --> D[Edit weekly availability grid per agent]
     A --> E[Coverage screen: weekly heatmap]
     E -->|red cells| F[Gap indicator + which agents would need to cover it]
+    E -->|amber cells| F2[Capacity warning + scheduled agents' current load vs target]
     A --> G[Tickets screen]
     G --> H[Simulate new ticket - dev helper]
     H --> I[Calls POST /assignment]
@@ -353,12 +414,19 @@ in a dropdown, since multi-company management/auth is out of scope):
    blocks are supported by simply dragging across the midnight row — the grid
    doesn't force blocks to stay within a single day. Saves via the `PUT
    .../availability` replace-all-blocks call.
-2. **Coverage.** A read-only weekly heatmap at company level: darker cells =
-   more agents available, red/hatched cells = zero agents (a gap). Hovering a
-   cell lists which agents *would* need to add availability to close that
-   gap. Cells are labeled in `company.display_timezone` (configurable in a
-   small settings control) purely for readability — the underlying data comes
-   from each agent's own zone as described in §4.
+2. **Coverage.** A read-only weekly heatmap at company level with three cell
+   states, not two: **normal** (darker = more agents available, per PRD's
+   original intent), **capacity warning** (amber/hatched — someone is
+   scheduled, but everyone scheduled is at or over their target capacity
+   right now, per the `capacity_warning` flag in §4), and **gap** (red — zero
+   agents scheduled at all). A small legend and a "load shown as of now" note
+   sit above the grid so the warning state isn't mistaken for a hard
+   prediction. Hovering a gap cell lists which agents would need to add
+   availability to close it; hovering a warning cell lists the scheduled
+   agents and their current active-ticket counts against their target
+   capacity. Cells are labeled in `company.display_timezone` (configurable in
+   a small settings control) purely for readability — the underlying data
+   comes from each agent's own zone as described in §4.
 3. **Tickets.** List of tickets with status, assigned agent, and a
    collapsed-by-default "why" row showing the stored `reason` string, with an
    `out_of_hours` / `over_capacity` badge when those flags are set so a lead
@@ -376,15 +444,18 @@ right:
 | Case | Behavior |
 |---|---|
 | Overnight block spans midnight (22:00–06:00) | Ticket arriving 02:00 local matches via the "continuation from yesterday's block" branch in §3.1. |
+| Overnight block spans **Sunday night into Monday morning** specifically | The `dow=1` (Monday) case is where the naive `prevDow` formula broke (§3.1) — a block declared on Sunday (`day_of_week=7`) continuing into early Monday must still match. Called out separately because it's the one boundary the original formula silently failed on; every other day-pair happened to work by coincidence. |
 | DST spring-forward, block boundary lands in the skipped hour | We never construct that local time ourselves — we only ever go UTC→local for "now," so there's no invalid-local-time to construct. Verified with a fixed-clock test at an instant a few minutes either side of a known US transition. |
 | DST fall-back, block boundary lands in the repeated hour | Same reasoning — `instantUtc.setZone(tz)` unambiguously resolves one instant at a time; we're not asking "does 1:30am exist," we're asking "what is the local time at instant X." |
 | Two agents tied on active count | `last_assigned_at` (nulls-first, so brand-new agents win ties over anyone ever assigned) breaks the tie; verified by asserting the *next* assignment after a tie goes to whichever agent didn't get the first one. |
 | Agent has zero availability blocks configured | Never appears in `available`, contributes to `out_of_hours` fallback pool only. |
 | Agent timezone edited between two assignment calls | No caching of computed availability anywhere — every call re-reads `agent.timezone` and re-runs §3.1 fresh, so the very next assignment reflects the change immediately, per PRD §8. |
-| Ticket doesn't belong to the given `company_id` | 404, not a silent cross-tenant assignment. |
+| Ticket doesn't belong to the given `company_id` | 404, not a silent cross-tenant assignment — enforced on **both** the new-assignment path and the idempotent-replay path (§3.4), since ownership is checked before either branches. |
+| Ticket already assigned, but request quotes the **wrong** `company_id` | 404, not a replayed assignment. This is the specific case the earlier ownership-after-replay ordering got wrong: an assigned ticket from Company A requested with Company B's `company_id` must not leak Company A's agent name or reason. |
 | `resolve` called on an already-resolved ticket | No-op per §3.5, active count naturally unaffected. |
 | `assignment` called twice for the same ticket | Second call is a pure read of the existing row (§3.4) — verified no new `ASSIGNMENT` row, no `last_assigned_at` change, no active-count shift. |
 | Company has agents but all are `inactive` | Same code path as "empty team" — `selectAgent` filters to `status == 'active'` before ever checking count, so an all-inactive team correctly throws `Unassignable` rather than silently picking an inactive agent. |
+| All agents scheduled for a slot are already at/over target capacity | Coverage grid marks the slot `capacity_warning: true`, `gap: false` (§4) — distinct from a true gap, since someone *is* nominally covering it. |
 
 ## 7. Test Plan
 
@@ -395,12 +466,23 @@ right:
   fall-back instants for a `America/New_York`-scheduled agent, asserting
   membership matches the intended local-time meaning of the shift, not a
   fixed UTC offset.
+  - **Regression: Sunday-night-to-Monday-morning overnight block.** Agent
+    has a single block `{ day_of_week: 7 (Sun), start_minute: 1320 (22:00),
+    end_minute: 360 (06:00) }`. Assert `isAvailableAt` returns `true` for an
+    instant that resolves to Monday 02:00 local, and `false` for Monday
+    07:00 local. This is the exact case the negative-modulo bug broke —
+    `prevDow` for Monday must resolve to Sunday (7), not 0.
 - `selectAgent`: normal tier picks lowest active count among available;
   under-capacity preferred over over-capacity when both exist; falls to
   over-capacity tier when all available agents are at/over cap; falls to
   out-of-hours tier when nobody is available, ignoring schedule entirely;
   throws `Unassignable` when the active-agent list is empty; tie-break by
   `last_assigned_at` (including the "never assigned = null = wins" case).
+- **Regression: active-count query matches the schema.** Seed an agent with
+  two `ASSIGNMENT` rows whose tickets are `open`, and one whose ticket is
+  `resolved`; assert the derived count returns 2, not 3 and not an error —
+  this exercises the actual `assignment JOIN ticket` query end-to-end rather
+  than assuming the join is correct from the pseudocode alone.
 
 **Integration tests (Supertest against a temp SQLite file, real HTTP layer)**
 - `POST /assignment` end-to-end: seeded company/agents/schedule/ticket →
@@ -408,15 +490,27 @@ right:
 - Idempotency: two identical `POST /assignment` calls → identical response
   body (bar `idempotent_replay`), exactly one `ASSIGNMENT` row in the DB,
   agent's active count unchanged by the second call.
+- **Regression: assigned-ticket, mismatched company_id.** Assign a ticket
+  under Company A. Then call `POST /assignment` for that same ticket with
+  Company B's `company_id`. Assert **404**, and assert the response body
+  contains no agent name, reason, or any other detail of the real
+  assignment — the ownership check must run before the replay branch, not
+  after it.
 - `POST /resolve` twice → `already_resolved: true` on the second call, active
   count for that agent drops by exactly one, not two.
 - Empty-team company → `POST /assignment` returns 409 `unassignable`.
 - All-agents-inactive company → same 409, not a crash.
-- Cross-company ticket/company_id mismatch → 404.
+- Cross-company ticket/company_id mismatch (unassigned ticket) → 404.
 - `PUT /agents/:id/availability` replace semantics: posting a new block set
   fully replaces the old one (no leftover blocks from a previous save).
 - Coverage endpoint: a company with a known gap (e.g. no agent covering
   Sunday) returns `gap: true` for exactly the expected slots.
+- **Regression: capacity warning distinct from gap.** Seed a company with one
+  agent scheduled for a slot whose active-ticket count is at or above their
+  `target_capacity`. Assert that slot returns `capacity_warning: true` and
+  `gap: false`. Seed a second slot with no agent scheduled at all and assert
+  the reverse (`gap: true`, `capacity_warning: false`), confirming the two
+  flags are never both `true` for the same slot.
 
 **Manual/UI checks**
 - Drag-painting an overnight block in the schedule grid persists and
@@ -426,4 +520,25 @@ right:
 - "Simulate new ticket" → ticket appears in the Tickets list already assigned
   with a readable reason, no manual refresh required.
 
+## 8. What's Stubbed / Simplified
 
+- Ticket creation is not a real feature — a `/dev/...` seeding endpoint and a
+  UI button stand in for "an external system creates tickets," per scope.
+- No auth/roles: any UI user can edit any company's data.
+- Single-process, file-based SQLite — fine for local/demo use, would move to
+  Postgres for anything multi-instance.
+- Coverage grid is a snapshot of the *current* calendar week, recomputed on
+  each request rather than cached/pushed live.
+- No notification/webhook when a ticket is flagged `out_of_hours` or
+  `over_capacity` — the flag is visible in the UI, but nothing proactively
+  pings the lead. Called out as the most obvious "what's next."
+
+## 9. What I'd Build Next
+
+1. Push/notify the lead when a ticket is assigned with `out_of_hours` or
+   `over_capacity` flagged, instead of requiring them to notice it in the UI.
+2. Support-hours-aware coverage gaps (only flag gaps inside a company's
+   declared support window, not 24/7) once that's defined.
+3. Reassignment/rebalancing for tickets whose owner goes on an extended
+   unavailability streak.
+4. Multi-team companies.
