@@ -519,26 +519,3 @@ right:
   for a manually-configured schedule.
 - "Simulate new ticket" → ticket appears in the Tickets list already assigned
   with a readable reason, no manual refresh required.
-
-## 8. What's Stubbed / Simplified
-
-- Ticket creation is not a real feature — a `/dev/...` seeding endpoint and a
-  UI button stand in for "an external system creates tickets," per scope.
-- No auth/roles: any UI user can edit any company's data.
-- Single-process, file-based SQLite — fine for local/demo use, would move to
-  Postgres for anything multi-instance.
-- Coverage grid is a snapshot of the *current* calendar week, recomputed on
-  each request rather than cached/pushed live.
-- No notification/webhook when a ticket is flagged `out_of_hours` or
-  `over_capacity` — the flag is visible in the UI, but nothing proactively
-  pings the lead. Called out as the most obvious "what's next."
-
-## 9. What I'd Build Next
-
-1. Push/notify the lead when a ticket is assigned with `out_of_hours` or
-   `over_capacity` flagged, instead of requiring them to notice it in the UI.
-2. Support-hours-aware coverage gaps (only flag gaps inside a company's
-   declared support window, not 24/7) once that's defined.
-3. Reassignment/rebalancing for tickets whose owner goes on an extended
-   unavailability streak.
-4. Multi-team companies.
